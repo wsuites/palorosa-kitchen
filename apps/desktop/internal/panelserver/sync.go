@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -193,13 +194,26 @@ func (s *Server) syncLoop(ctx context.Context) {
 		case <-timer.C:
 		}
 		if run, full := s.syncer.due(s.syncInterval(), s.syncFullInterval(), time.Now()); run {
-			if s.syncer.sync(ctx, syncDates(""), full) {
+			if s.runSync(ctx, syncDates(""), full) {
 				s.Publish("orders")
 				s.Publish("sync")
 			}
 		}
 		timer.Reset(time.Minute)
 	}
+}
+
+// runSync runs one background sync. An unrecovered panic in this goroutine
+// would kill the whole app (a fatal panic prints to a stderr the GUI build
+// never shows), so it is caught, logged and the loop keeps going: a failed
+// store refresh must not take the kitchen down.
+func (s *Server) runSync(ctx context.Context, dates []string, full bool) (ran bool) {
+	defer func() {
+		if value := recover(); value != nil {
+			s.log.Printf("sync: panic: %v\n%s", value, debug.Stack())
+		}
+	}()
+	return s.syncer.sync(ctx, dates, full)
 }
 
 // handleSyncGet reports the last store sync.

@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +60,10 @@ func (b *logRing) AttachFile(path string) {
 		b.add(stamp("log: " + err.Error()))
 		return
 	}
+	// An unhandled panic writes to stderr, which the windowsgui build throws
+	// away: mirror the fatal crash into app.log so a close with no message
+	// still leaves the reason behind.
+	_ = debug.SetCrashOutput(f, debug.CrashOptions{})
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.file = f
