@@ -20,6 +20,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/wsuites/palorosa-kitchen/apps/desktop/internal/antibot"
 )
 
 // Config are the store credentials and the saved export to run.
@@ -34,6 +36,10 @@ type Config struct {
 	CronKey string
 	// Token is the download token; empty derives it from the cron key.
 	Token string
+	// BrowserSession opens a real browser when the store's bot challenge
+	// blocks a step: the cookies it grants are adopted and the step is
+	// retried once. Nil keeps the plain HTTP behaviour.
+	BrowserSession func(ctx context.Context) ([]*http.Cookie, error)
 }
 
 // Token is substr(md5(cronKey + exportId), 0, 16), what WP All Export expects.
@@ -42,7 +48,10 @@ func Token(cronKey, exportID string) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
-const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+// UserAgent is the browser the client presents. A browser session created to
+// pass the store's bot challenge must announce the same one, since the host
+// may tie its whitelist to it.
+const UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 
 var months = []string{"enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"}
 
@@ -91,7 +100,7 @@ func (c *Client) do(ctx context.Context, method, target string, form url.Values)
 	if err != nil {
 		return nil, nil, err
 	}
-	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "es-ES,es;q=0.9")
 	if form != nil {
@@ -118,8 +127,45 @@ func (c *Client) loggedIn() bool {
 	return false
 }
 
-// Login opens a wp-admin session.
+// withRecovery runs step; when the store's bot challenge blocks it, it mints
+// a browser-granted session once, adopts its cookies and retries the step.
+func (c *Client) withRecovery(ctx context.Context, step func() error) error {
+	err := step()
+	var challenge *antibot.ChallengeError
+	if err == nil || c.cfg.BrowserSession == nil || !errors.As(err, &challenge) {
+		return err
+	}
+	if mintErr := c.mintSession(ctx); mintErr != nil {
+		return errors.Join(err, fmt.Errorf("no se pudo verificar la conexión por navegador: %w", mintErr))
+	}
+	return step()
+}
+
+// mintSession adopts the cookies a verified browser was granted, as if the
+// store had just sent them for the site root.
+func (c *Client) mintSession(ctx context.Context) error {
+	cookies, err := c.cfg.BrowserSession(ctx)
+	if err != nil {
+		return err
+	}
+	if len(cookies) == 0 {
+		return nil
+	}
+	u, err := url.Parse(c.cfg.Base + "/")
+	if err != nil {
+		return err
+	}
+	c.http.Jar.SetCookies(u, cookies)
+	return nil
+}
+
+// Login opens a wp-admin session, passing a bot challenge through the browser
+// session when needed.
 func (c *Client) Login(ctx context.Context) error {
+	return c.withRecovery(ctx, func() error { return c.login(ctx) })
+}
+
+func (c *Client) login(ctx context.Context) error {
 	loginURL := c.cfg.Base + "/wp-login.php"
 	if _, _, err := c.do(ctx, http.MethodGet, loginURL, nil); err != nil {
 		return err
@@ -133,11 +179,14 @@ func (c *Client) Login(ctx context.Context) error {
 		"redirect_to": {c.cfg.Base + "/wp-admin/"},
 		"testcookie":  {"1"},
 	}
-	resp, _, err := c.do(ctx, http.MethodPost, loginURL, form)
+	resp, body, err := c.do(ctx, http.MethodPost, loginURL, form)
 	if err != nil {
 		return err
 	}
 	if !c.loggedIn() {
+		if err := antibot.Error(resp, body); err != nil {
+			return err
+		}
 		return fmt.Errorf("WordPress no inició sesión (HTTP %d); revisa el usuario y la contraseña", resp.StatusCode)
 	}
 	return nil
@@ -231,10 +280,18 @@ func setStoreDate(fields []field, storeDate string) ([]field, bool) {
 	return out, found
 }
 
-// SetDeliveryDate rewrites the saved export's delivery-date filter.
+// SetDeliveryDate rewrites the saved export's delivery-date filter, passing a
+// bot challenge through the browser session when needed.
 func (c *Client) SetDeliveryDate(ctx context.Context, storeDate string) error {
-	_, page, err := c.do(ctx, http.MethodGet, c.cfg.Base+"/wp-admin/admin.php?page=pmxe-admin-manage", nil)
+	return c.withRecovery(ctx, func() error { return c.setDeliveryDate(ctx, storeDate) })
+}
+
+func (c *Client) setDeliveryDate(ctx context.Context, storeDate string) error {
+	resp, page, err := c.do(ctx, http.MethodGet, c.cfg.Base+"/wp-admin/admin.php?page=pmxe-admin-manage", nil)
 	if err != nil {
+		return err
+	}
+	if err := antibot.Error(resp, page); err != nil {
 		return err
 	}
 	id := regexp.QuoteMeta(c.cfg.ExportID)
@@ -243,8 +300,11 @@ func (c *Client) SetDeliveryDate(ctx context.Context, storeDate string) error {
 		return fmt.Errorf("no se encontró el export %s en WP All Export (¿id incorrecto o usuario sin permisos?)", c.cfg.ExportID)
 	}
 	optionsURL := fmt.Sprintf("%s/wp-admin/admin.php?page=pmxe-admin-manage&id=%s&action=options&_wpnonce_options=%s", c.cfg.Base, url.QueryEscape(c.cfg.ExportID), nonce[1])
-	_, page, err = c.do(ctx, http.MethodGet, optionsURL, nil)
+	resp, page, err = c.do(ctx, http.MethodGet, optionsURL, nil)
 	if err != nil {
+		return err
+	}
+	if err := antibot.Error(resp, page); err != nil {
 		return err
 	}
 	var form string
@@ -265,7 +325,7 @@ func (c *Client) SetDeliveryDate(ctx context.Context, storeDate string) error {
 	for _, f := range fields {
 		values.Add(f.name, f.value)
 	}
-	resp, _, err := c.do(ctx, http.MethodPost, optionsURL, values)
+	resp, _, err = c.do(ctx, http.MethodPost, optionsURL, values)
 	if err != nil {
 		return err
 	}
@@ -275,19 +335,30 @@ func (c *Client) SetDeliveryDate(ctx context.Context, storeDate string) error {
 	return nil
 }
 
-// Run triggers the export and waits until WP All Export reports it complete.
+// Run triggers the export and waits until WP All Export reports it complete,
+// passing a bot challenge through the browser session when needed.
 func (c *Client) Run(ctx context.Context) error {
+	return c.withRecovery(ctx, func() error { return c.run(ctx) })
+}
+
+func (c *Client) run(ctx context.Context) error {
 	query := "export_key=" + url.QueryEscape(c.cfg.CronKey) + "&export_id=" + url.QueryEscape(c.cfg.ExportID)
 	resp, body, err := c.do(ctx, http.MethodGet, c.cfg.Base+"/wp-load.php?"+query+"&action=trigger", nil)
 	if err != nil {
+		return err
+	}
+	if err := antibot.Error(resp, body); err != nil {
 		return err
 	}
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("WP All Export no aceptó la Cron key (HTTP %d): %s", resp.StatusCode, snippet(body))
 	}
 	for attempt := 0; attempt < 30; attempt++ {
-		_, body, err := c.do(ctx, http.MethodGet, c.cfg.Base+"/wp-load.php?"+query+"&action=processing", nil)
+		resp, body, err := c.do(ctx, http.MethodGet, c.cfg.Base+"/wp-load.php?"+query+"&action=processing", nil)
 		if err != nil {
+			return err
+		}
+		if err := antibot.Error(resp, body); err != nil {
 			return err
 		}
 		if strings.Contains(string(body), "complete") {
@@ -302,21 +373,39 @@ func (c *Client) Run(ctx context.Context) error {
 	return errors.New("WP All Export no terminó el export a tiempo")
 }
 
-// Download fetches the last generated file.
+// Download fetches the last generated file, passing a bot challenge through
+// the browser session when needed.
 func (c *Client) Download(ctx context.Context) ([]byte, error) {
+	var data []byte
+	err := c.withRecovery(ctx, func() error {
+		var downloadErr error
+		data, downloadErr = c.download(ctx)
+		return downloadErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func (c *Client) download(ctx context.Context) ([]byte, error) {
 	target := fmt.Sprintf("%s/wp-load.php?security_token=%s&export_id=%s&action=get_data", c.cfg.Base, url.QueryEscape(c.cfg.Token), url.QueryEscape(c.cfg.ExportID))
 	resp, body, err := c.do(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
+		if err := antibot.Error(resp, body); err != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("no se pudo descargar el export (HTTP %d)", resp.StatusCode)
 	}
 	return body, nil
 }
 
 // Rows runs the export for one delivery date (YYYY-MM-DD) and returns the
-// sheet rows, header first. The session is opened on first use.
+// sheet rows, header first. The session is opened on first use; each step
+// passes a bot challenge through the browser session when needed.
 func (c *Client) Rows(ctx context.Context, isoDate string) ([][]string, error) {
 	storeDate, err := StoreDate(isoDate)
 	if err != nil {

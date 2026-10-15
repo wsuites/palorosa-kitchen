@@ -27,6 +27,7 @@ import (
 	"github.com/wsuites/palorosa-kitchen/apps/desktop/internal/auth"
 	"github.com/wsuites/palorosa-kitchen/apps/desktop/internal/autostart"
 	"github.com/wsuites/palorosa-kitchen/apps/desktop/internal/bots"
+	"github.com/wsuites/palorosa-kitchen/apps/desktop/internal/browsersession"
 	"github.com/wsuites/palorosa-kitchen/apps/desktop/internal/config"
 	"github.com/wsuites/palorosa-kitchen/apps/desktop/internal/engine"
 	"github.com/wsuites/palorosa-kitchen/apps/desktop/internal/labels"
@@ -807,21 +808,28 @@ func startPanel(cfg config.Config, bot *botShell, targets *notify.Manager, store
 				values = store.Values()
 			}
 			wp := config.ResolveWP(values)
+			// When SiteGround's Anti-Bot AI blocks the store, pass the
+			// challenge once in a real Edge (visible only if it asks for the
+			// interactive captcha) and keep its cookies for both the export
+			// and the WooCommerce lookup.
+			browserSession := browsersession.ForStore(cfg.DataDir, wp.AdminURL, wpexport.UserAgent)
 			request := whatsapp.SyncRequest{
-				Dates:       dates,
-				APIBase:     wp.AdminURL,
-				APIKey:      wp.ConsumerKey,
-				APISecret:   wp.ConsumerSecret,
-				CreatedDays: values.SyncCreatedDays,
-				Full:        full,
+				Dates:          dates,
+				APIBase:        wp.AdminURL,
+				APIKey:         wp.ConsumerKey,
+				APISecret:      wp.ConsumerSecret,
+				BrowserSession: browserSession,
+				CreatedDays:    values.SyncCreatedDays,
+				Full:           full,
 			}
 			exporter, err := wpexport.New(wpexport.Config{
-				Base:     wp.AdminURL,
-				User:     wp.AdminUser,
-				Password: wp.AdminPassword,
-				ExportID: wp.ExportID,
-				CronKey:  wp.ExportCronKey,
-				Token:    wp.ExportToken,
+				Base:           wp.AdminURL,
+				User:           wp.AdminUser,
+				Password:       wp.AdminPassword,
+				ExportID:       wp.ExportID,
+				CronKey:        wp.ExportCronKey,
+				Token:          wp.ExportToken,
+				BrowserSession: browserSession,
 			})
 			if err != nil {
 				// Without the export the lookup still refreshes the days, as

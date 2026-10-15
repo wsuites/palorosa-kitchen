@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wsuites/palorosa-kitchen/apps/desktop/internal/antibot"
 	"github.com/wsuites/palorosa-kitchen/apps/desktop/internal/engine"
 )
 
@@ -252,6 +253,9 @@ func (r *Runner) checkWooOrders(ctx context.Context) (Status, string) {
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return Fail, "La tienda rechazó las credenciales de la API (HTTP " + strconv.Itoa(resp.StatusCode) + ")"
 	default:
+		if err := antibot.Error(resp, raw); err != nil {
+			return Fail, err.Error()
+		}
 		return Fail, fmt.Sprintf("La tienda respondió HTTP %d", resp.StatusCode)
 	}
 	if err := json.Unmarshal(raw, &orders); err != nil {
@@ -320,6 +324,9 @@ var htmlTag = regexp.MustCompile(`<[^>]+>`)
 // text when there is one, otherwise what the response looked like, so a
 // captcha, firewall or redirect is not reported as a wrong password.
 func loginFailure(resp *http.Response, page, base string) string {
+	if err := antibot.Error(resp, []byte(page)); err != nil {
+		return err.Error()
+	}
 	if m := loginErrorPattern.FindStringSubmatch(page); m != nil {
 		text := strings.Join(strings.Fields(html.UnescapeString(htmlTag.ReplaceAllString(m[1], " "))), " ")
 		text = strings.TrimPrefix(strings.TrimPrefix(text, "Error:"), "ERROR:")

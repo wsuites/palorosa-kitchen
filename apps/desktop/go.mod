@@ -3,6 +3,7 @@ module github.com/wsuites/palorosa-kitchen/apps/desktop
 go 1.27.0
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/getlantern/systray v1.2.2
 	github.com/mattn/go-sqlite3 v1.14.52
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
@@ -16,7 +17,6 @@ require (
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/beeper/argo-go v1.1.2 // indirect
-	github.com/coder/websocket v1.8.15 // indirect
 	github.com/elliotchance/orderedmap/v3 v3.1.0 // indirect
 	github.com/getlantern/context v0.0.0-20190109183933-c447772a6520 // indirect
 	github.com/getlantern/errors v0.0.0-20190325191628-abdb3e3e36f7 // indirect

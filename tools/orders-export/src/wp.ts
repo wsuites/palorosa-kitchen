@@ -9,6 +9,12 @@ import { readXlsxRows } from './xlsx'
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
 
+/** SiteGround's anti-bot challenge: HTTP 202 plus a JS captcha page, no login. */
+function antiBotChallenge (response: Response, body: string): boolean {
+  if (response.headers.get('sg-captcha')) return true
+  return response.status === 202 && /sgcaptcha|robot challenge screen/i.test(body)
+}
+
 interface Field {
   name: string
   value: string
@@ -105,15 +111,20 @@ export class WpAllExportClient {
       redirect_to: `${this.config.base}/wp-admin/`,
       testcookie: '1',
     })
-    await (
-      await this.request(`${this.config.base}/wp-login.php`, {
-        method: 'POST',
-        body,
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        redirect: 'manual',
-      })
-    ).text()
+    const response = await this.request(`${this.config.base}/wp-login.php`, {
+      method: 'POST',
+      body,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      redirect: 'manual',
+    })
+    const text = await response.text()
     if (![...this.cookies.keys()].some((name) => name.startsWith('wordpress_logged_in'))) {
+      if (antiBotChallenge(response, text)) {
+        throw new Error(
+          'SiteGround anti-bot challenge (HTTP 202): the host is challenging this IP, so no session cookie comes back. ' +
+            'Ask SiteGround to allowlist this machine in their Anti-Bot AI / SG-Captcha.'
+        )
+      }
       throw new Error('WP login failed (no session cookie). Check WP_ADMIN_USER / WP_ADMIN_PASSWORD.')
     }
   }

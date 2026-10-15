@@ -3,7 +3,12 @@ package wpexport
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -78,5 +83,102 @@ func TestReadXLSX(t *testing.T) {
 		if strings.Join(rows[i], "|") != strings.Join(want[i], "|") {
 			t.Fatalf("row %d = %#v, want %#v", i, rows[i], want[i])
 		}
+	}
+}
+
+func TestLoginReportsBotChallenge(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("SG-Captcha", "challenge")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = io.WriteString(w, `<html><head><meta http-equiv="refresh" content="0;/.well-known/sgcaptcha/?r=%2Fwp-login.php&y=ipc:1.2.3.4:1"></head></html>`)
+	}))
+	defer srv.Close()
+	client, err := New(Config{Base: srv.URL, User: "cocina", Password: "secreta", CronKey: "key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.Login(context.Background())
+	if err == nil {
+		t.Fatal("expected a login error")
+	}
+	if !strings.Contains(err.Error(), "SiteGround") {
+		t.Fatalf("challenge not detected: %v", err)
+	}
+	if strings.Contains(err.Error(), "revisa el usuario") {
+		t.Fatalf("challenge explained as bad credentials: %v", err)
+	}
+}
+
+func TestLoginWrongPasswordKeepsCredentialsMessage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `<html><body><form><input name="pwd"></form><div id="login_error">La contraseña es incorrecta.</div></body></html>`)
+	}))
+	defer srv.Close()
+	client, err := New(Config{Base: srv.URL, User: "cocina", Password: "mala", CronKey: "key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.Login(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "revisa el usuario y la contraseña") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestLoginRecoversThroughBrowserSession(t *testing.T) {
+	var logins, sessions int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			_, _ = io.WriteString(w, `<html><form><input name="pwd"></form></html>`)
+			return
+		}
+		logins++
+		if !strings.Contains(r.Header.Get("Cookie"), "_I_=") {
+			w.Header().Set("SG-Captcha", "challenge")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = io.WriteString(w, `<html><head><meta http-equiv="refresh" content="0;/.well-known/sgcaptcha/?r=%2Fwp-login.php"></head></html>`)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{Name: "wordpress_logged_in_abc", Value: "yes", Path: "/", HttpOnly: true})
+		_, _ = io.WriteString(w, `<html>panel</html>`)
+	}))
+	defer srv.Close()
+
+	client, err := New(Config{
+		Base: srv.URL, User: "cocina", Password: "secreta", CronKey: "key",
+		BrowserSession: func(context.Context) ([]*http.Cookie, error) {
+			sessions++
+			return []*http.Cookie{{Name: "_I_", Value: "whitelisted", Path: "/"}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Login(context.Background()); err != nil {
+		t.Fatalf("login with browser recovery = %v", err)
+	}
+	if sessions != 1 || logins != 2 {
+		t.Fatalf("sessions = %d, logins = %d; want 1 and 2", sessions, logins)
+	}
+}
+
+func TestLoginReportsFailedBrowserSession(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("SG-Captcha", "challenge")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = io.WriteString(w, `<html>Robot Challenge Screen</html>`)
+	}))
+	defer srv.Close()
+	client, err := New(Config{
+		Base: srv.URL, User: "cocina", Password: "secreta", CronKey: "key",
+		BrowserSession: func(context.Context) ([]*http.Cookie, error) {
+			return nil, errors.New("no se encontró Microsoft Edge")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.Login(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "SiteGround") || !strings.Contains(err.Error(), "Microsoft Edge") {
+		t.Fatalf("err = %v", err)
 	}
 }

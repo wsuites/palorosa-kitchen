@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -142,7 +143,7 @@ func TestFetchStoreOrdersPaginates(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	orders, err := c.fetchStoreOrders(context.Background(), server.URL, "ck", "cs", time.Now().AddDate(0, 0, -45))
+	orders, err := c.fetchStoreOrders(context.Background(), SyncRequest{APIBase: server.URL, APIKey: "ck", APISecret: "cs"}, time.Now().AddDate(0, 0, -45))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,6 +152,40 @@ func TestFetchStoreOrdersPaginates(t *testing.T) {
 	}
 	if page != 2 {
 		t.Fatalf("pages = %d, want 2", page)
+	}
+}
+
+// TestFetchStoreOrdersRecoversFromBotChallenge is the Anti-Bot rule: when the
+// host answers the lookup with the challenge, a browser session mints the
+// cookies once and the same page is retried with them.
+func TestFetchStoreOrdersRecoversFromBotChallenge(t *testing.T) {
+	c := testClient(t)
+	requests, sessions := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if !strings.Contains(r.Header.Get("Cookie"), "_I_=") {
+			w.Header().Set("SG-Captcha", "challenge")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`<html>Robot Challenge Screen</html>`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]map[string]any{orderJSON("7", "processing", "4 octubre, 2026")})
+	}))
+	t.Cleanup(server.Close)
+
+	orders, err := c.fetchStoreOrders(context.Background(), SyncRequest{
+		APIBase: server.URL, APIKey: "ck", APISecret: "cs",
+		BrowserSession: func(context.Context) ([]*http.Cookie, error) {
+			sessions++
+			return []*http.Cookie{{Name: "_I_", Value: "whitelisted", Path: "/"}}, nil
+		},
+	}, time.Now().AddDate(0, 0, -45))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orders) != 1 || sessions != 1 || requests != 2 {
+		t.Fatalf("orders = %d, sessions = %d, requests = %d", len(orders), sessions, requests)
 	}
 }
 

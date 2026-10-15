@@ -7,14 +7,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/wsuites/palorosa-kitchen/apps/desktop/internal/antibot"
 	"github.com/wsuites/palorosa-kitchen/apps/desktop/internal/engine"
 	"github.com/wsuites/palorosa-kitchen/apps/desktop/internal/labels"
+	"github.com/wsuites/palorosa-kitchen/apps/desktop/internal/wpexport"
 )
 
 // ExportRows returns the WP All Export sheet (header first) for one delivery
@@ -33,6 +36,10 @@ type SyncRequest struct {
 	APIBase   string
 	APIKey    string
 	APISecret string
+	// BrowserSession opens a real browser when the store's bot challenge
+	// blocks the lookup: the cookies it grants are adopted and the request
+	// retried once. See wpexport.Config.BrowserSession.
+	BrowserSession func(ctx context.Context) ([]*http.Cookie, error)
 	// CreatedDays is the lookup window in days back from now. Zero means
 	// DefaultCreatedDays.
 	CreatedDays int
@@ -126,7 +133,7 @@ func (c *Client) SyncStore(ctx context.Context, req SyncRequest) (SyncResult, er
 		if window > maxCreatedDays {
 			window = maxCreatedDays
 		}
-		orders, err := c.fetchStoreOrders(ctx, req.APIBase, req.APIKey, req.APISecret, time.Now().AddDate(0, 0, -window))
+		orders, err := c.fetchStoreOrders(ctx, req, time.Now().AddDate(0, 0, -window))
 		if err != nil {
 			failures = append(failures, err.Error())
 		} else {
@@ -430,13 +437,17 @@ func (c *Client) replaceDay(date string, orders map[string][]engine.ParsedOrderL
 // fetchStoreOrders pages the WooCommerce REST orders created after `after`.
 // The delivery date lives in meta_data, which the REST API cannot filter, so
 // the lookup takes a creation window and the caller groups by delivery date.
-func (c *Client) fetchStoreOrders(ctx context.Context, base, key, secret string, after time.Time) ([]woocommerceOrder, error) {
-	base = strings.TrimRight(strings.TrimSpace(base), "/")
+// A page blocked by the host bot challenge is retried once through a browser
+// session, when one is set.
+func (c *Client) fetchStoreOrders(ctx context.Context, req SyncRequest, after time.Time) ([]woocommerceOrder, error) {
+	base := strings.TrimRight(strings.TrimSpace(req.APIBase), "/")
 	if base == "" {
 		return nil, errors.New("falta la URL de la tienda (Ajustes)")
 	}
-	client := &http.Client{Timeout: 60 * time.Second}
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Timeout: 60 * time.Second, Jar: jar}
 	var out []woocommerceOrder
+	recovered := false
 	for page := 1; page <= wooMaxPages; page++ {
 		endpoint := base + "/wp-json/wc/v3/orders?per_page=" + strconv.Itoa(wooOrdersPerPage) +
 			"&page=" + strconv.Itoa(page) +
@@ -446,8 +457,9 @@ func (c *Client) fetchStoreOrders(ctx context.Context, base, key, secret string,
 		if err != nil {
 			return nil, err
 		}
-		request.SetBasicAuth(key, secret)
+		request.SetBasicAuth(req.APIKey, req.APISecret)
 		request.Header.Set("Accept", "application/json")
+		request.Header.Set("User-Agent", wpexport.UserAgent)
 		response, err := client.Do(request)
 		if err != nil {
 			return nil, fmt.Errorf("no se pudo consultar la tienda: %w", err)
@@ -455,6 +467,17 @@ func (c *Client) fetchStoreOrders(ctx context.Context, base, key, secret string,
 		raw, readErr := io.ReadAll(io.LimitReader(response.Body, 32<<20))
 		response.Body.Close()
 		if response.StatusCode != http.StatusOK {
+			if challenge := antibot.Error(response, raw); challenge != nil {
+				if req.BrowserSession == nil || recovered {
+					return nil, challenge
+				}
+				recovered = true
+				if mintErr := adoptSession(ctx, jar, base, req.BrowserSession); mintErr != nil {
+					return nil, errors.Join(challenge, fmt.Errorf("no se pudo verificar la conexión por navegador: %w", mintErr))
+				}
+				page-- // the same page again, now with the browser cookies
+				continue
+			}
 			return nil, fmt.Errorf("la tienda respondió %s al listar pedidos", response.Status)
 		}
 		if readErr != nil {
@@ -470,4 +493,22 @@ func (c *Client) fetchStoreOrders(ctx context.Context, base, key, secret string,
 		}
 	}
 	return out, nil
+}
+
+// adoptSession mints a browser-granted session and stores its cookies for the
+// store, so the retried request presents the verified identity.
+func adoptSession(ctx context.Context, jar *cookiejar.Jar, base string, mint func(context.Context) ([]*http.Cookie, error)) error {
+	cookies, err := mint(ctx)
+	if err != nil {
+		return err
+	}
+	if len(cookies) == 0 {
+		return nil
+	}
+	u, err := url.Parse(base + "/")
+	if err != nil {
+		return err
+	}
+	jar.SetCookies(u, cookies)
+	return nil
 }
